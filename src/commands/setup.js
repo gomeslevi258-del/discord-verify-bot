@@ -46,10 +46,15 @@ module.exports = {
     ),
 
   async execute(interaction) {
+    // DeferReply IMEDIATAMENTE para evitar timeout de 3s do Discord
+    await interaction.deferReply({ ephemeral: true });
+
     try {
       const verifyChannel = interaction.options.getChannel('canal', true);
       const role = interaction.options.getRole('cargo', true);
       const logChannel = interaction.options.getChannel('canal_log', true);
+
+      console.log(`[setup] Guild: ${interaction.guildId}, Canal: ${verifyChannel.id}, Cargo: ${role.id}, Log: ${logChannel.id}`);
 
       // Salva a configuração no banco para uso no endpoint interno.
       await saveGuildConfig(interaction.guildId, {
@@ -57,6 +62,8 @@ module.exports = {
         verify_channel_id: verifyChannel.id,
         log_channel_id: logChannel.id,
       });
+
+      console.log('[setup] Configuração salva no banco com sucesso.');
 
       const embed = new EmbedBuilder()
         .setTitle('🔐 Verificação de Membro')
@@ -87,23 +94,17 @@ module.exports = {
         components: [row],
       });
 
-      await interaction.reply({
+      console.log('[setup] Mensagem de verificação enviada no canal.');
+
+      await interaction.editReply({
         content: `✅ Configuração salva com sucesso. Mensagem enviada em ${verifyChannel}.`,
-        ephemeral: true,
       });
     } catch (error) {
       console.error('Erro ao executar /setup:', error);
 
-      const payload = {
+      await interaction.editReply({
         content: '❌ Não foi possível concluir o setup. Verifique permissões e tente novamente.',
-        ephemeral: true,
-      };
-
-      if (interaction.replied || interaction.deferred) {
-        await interaction.followUp(payload);
-      } else {
-        await interaction.reply(payload);
-      }
+      });
     }
   },
 };

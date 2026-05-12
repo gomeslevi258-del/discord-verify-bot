@@ -1,6 +1,15 @@
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const isMockDb = String(process.env.MOCK_DB || '').toLowerCase() === 'true';
+
+/**
+ * Gera um ID compatível com cuid() do Prisma.
+ * Usa crypto.randomBytes para gerar um ID único.
+ */
+function generateId() {
+  return 'c' + crypto.randomBytes(12).toString('hex').slice(0, 24);
+}
 
 // Stores em memória para desenvolvimento sem PostgreSQL.
 const guildConfigStore = new Map();
@@ -10,13 +19,27 @@ let pool = null;
 
 if (!isMockDb) {
   // Reutiliza a mesma connection string do site principal.
+  // Remove sslmode from URL and configure SSL separately to avoid pg warnings
+  let connectionString = process.env.DATABASE_URL || '';
+  connectionString = connectionString.replace(/[?&]sslmode=[^&]*/g, '');
+  
   pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    connectionString,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000,
+    max: 5,
   });
 
   pool.on('error', (err) => {
     console.error('Erro inesperado no pool PostgreSQL (bot):', err);
+  });
+  
+  // Test connection on startup
+  pool.query('SELECT 1').then(() => {
+    console.log('[database] Conexão com PostgreSQL estabelecida com sucesso.');
+  }).catch((err) => {
+    console.error('[database] FALHA ao conectar no PostgreSQL:', err.message);
   });
 } else {
   console.log('[database] MOCK_DB=true ativo no bot. Usando Map em memória.');
@@ -89,16 +112,18 @@ async function saveGuildConfig(guildId, config) {
     return Promise.resolve(payload);
   }
 
+  const id = generateId();
   const result = await query(
     `
       INSERT INTO guild_config (
+        id,
         guild_id,
         verified_role_id,
         verify_channel_id,
         log_channel_id,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, NOW())
+      VALUES ($1, $2, $3, $4, $5, NOW())
       ON CONFLICT (guild_id)
       DO UPDATE SET
         verified_role_id = EXCLUDED.verified_role_id,
@@ -108,6 +133,7 @@ async function saveGuildConfig(guildId, config) {
       RETURNING guild_id, verified_role_id, verify_channel_id, log_channel_id, updated_at
     `,
     [
+      id,
       guildId,
       config.verified_role_id,
       config.verify_channel_id,
@@ -146,20 +172,22 @@ async function createToken(token, guildId, userId, expiresAt) {
   }
 
   const expiry = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
+  const id = generateId();
 
   const result = await query(
     `
       INSERT INTO verification_tokens (
+        id,
         token,
         guild_id,
         user_id,
         discord_user_id,
         expires_at
       )
-      VALUES ($1, $2, $3, $4, $5)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING id, token, guild_id, user_id, discord_user_id, expires_at, used_at, created_at
     `,
-    [token, guildId, userId, userId, expiry]
+    [id, token, guildId, userId, userId, expiry]
   );
 
   return result.rows[0];
