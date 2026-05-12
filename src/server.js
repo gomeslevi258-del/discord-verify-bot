@@ -1,5 +1,5 @@
 const express = require('express');
-const { query, getPendingAssignment } = require('./database');
+const { getPendingAssignment, markPendingProcessed, createProcessedAssignment } = require('./database');
 
 /**
  * Inicia servidor interno HTTP para comunicação do site com o bot.
@@ -159,28 +159,9 @@ function startInternalServer(incomingClient) {
 
       // Marca como processado na fila. Se não existir item pendente, cria já como processado.
       if (assignment.pending_id) {
-        await query(
-          `
-            UPDATE pending_role_assignments
-            SET processed = TRUE
-            WHERE id = $1
-          `,
-          [assignment.pending_id]
-        );
+        await markPendingProcessed(assignment.pending_id);
       } else {
-        await query(
-          `
-            INSERT INTO pending_role_assignments (
-              token,
-              discord_id,
-              guild_id,
-              role_id,
-              processed
-            )
-            VALUES ($1, $2, $3, $4, TRUE)
-          `,
-          [token, discordId, guildId, roleId]
-        );
+        await createProcessedAssignment(token, discordId, guildId, roleId);
       }
 
       // Opcional: registra mensagem no canal de logs, se configurado.

@@ -1,68 +1,51 @@
-const { Pool } = require('pg');
-const crypto = require('crypto');
+/**
+ * database.js — Acessa o banco via API do site (verificamembro.com)
+ * O banco é hospedado na Abacus AI e não aceita conexões externas.
+ * Por isso, o bot faz chamadas HTTP para o site, que acessa o banco com Prisma.
+ */
+
+const SITE_URL = (process.env.SITE_URL || 'https://verificamembro.com').replace(/\/$/, '');
+const API_SECRET = process.env.INTERNAL_API_SECRET || '';
 
 const isMockDb = String(process.env.MOCK_DB || '').toLowerCase() === 'true';
-
-/**
- * Gera um ID compatível com cuid() do Prisma.
- * Usa crypto.randomBytes para gerar um ID único.
- */
-function generateId() {
-  return 'c' + crypto.randomBytes(12).toString('hex').slice(0, 24);
-}
 
 // Stores em memória para desenvolvimento sem PostgreSQL.
 const guildConfigStore = new Map();
 const mockTokenStore = new Map();
 
-let pool = null;
-
-if (!isMockDb) {
-  // Reutiliza a mesma connection string do site principal.
-  // Remove sslmode from URL and configure SSL separately to avoid pg warnings
-  let connectionString = process.env.DATABASE_URL || '';
-  connectionString = connectionString.replace(/[?&]sslmode=[^&]*/g, '');
-  
-  pool = new Pool({
-    connectionString,
-    ssl: { rejectUnauthorized: false },
-    connectionTimeoutMillis: 10000,
-    idleTimeoutMillis: 30000,
-    max: 5,
-  });
-
-  pool.on('error', (err) => {
-    console.error('Erro inesperado no pool PostgreSQL (bot):', err);
-  });
-  
-  // Test connection on startup
-  pool.query('SELECT 1').then(() => {
-    console.log('[database] Conexão com PostgreSQL estabelecida com sucesso.');
-  }).catch((err) => {
-    console.error('[database] FALHA ao conectar no PostgreSQL:', err.message);
-  });
-} else {
+if (isMockDb) {
   console.log('[database] MOCK_DB=true ativo no bot. Usando Map em memória.');
+} else {
+  console.log(`[database] Modo API ativo. Chamando ${SITE_URL}/api/bot/...`);
 }
 
 /**
- * Wrapper para execução de query SQL parametrizada.
- * @param {string} text
- * @param {Array<any>} params
+ * Faz uma requisição HTTP para a API do site.
  */
-async function query(text, params = []) {
-  if (isMockDb) {
-    // Mantém assinatura compatível com pg para chamadas futuras.
-    return Promise.resolve({
-      command: 'MOCK',
-      rowCount: 0,
-      rows: [],
-      text,
-      params,
-    });
+async function apiCall(method, path, body = null) {
+  const url = `${SITE_URL}${path}`;
+  const headers = {
+    'x-api-secret': API_SECRET,
+    'Content-Type': 'application/json',
+  };
+
+  const options = {
+    method,
+    headers,
+  };
+
+  if (body) {
+    options.body = JSON.stringify(body);
   }
 
-  return pool.query(text, params);
+  const response = await fetch(url, options);
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`API ${method} ${path} falhou (${response.status}): ${data.error || JSON.stringify(data)}`);
+  }
+
+  return data;
 }
 
 /**
@@ -75,17 +58,20 @@ async function getGuildConfig(guildId) {
     return Promise.resolve(config);
   }
 
-  const result = await query(
-    `
-      SELECT guild_id, verified_role_id, log_channel_id, verify_channel_id, webhook_url, created_at, updated_at
-      FROM guild_config
-      WHERE guild_id = $1
-      LIMIT 1
-    `,
-    [guildId]
-  );
-
-  return result.rows[0] || null;
+  const result = await apiCall('GET', `/api/bot/guild-config?guildId=${encodeURIComponent(guildId)}`);
+  
+  if (!result.data) return null;
+  
+  // Map Prisma field names to snake_case for compatibility with bot code
+  return {
+    guild_id: result.data.guildId,
+    verified_role_id: result.data.verifiedRoleId,
+    log_channel_id: result.data.logChannelId,
+    verify_channel_id: result.data.verifyChannelId,
+    webhook_url: result.data.webhookUrl,
+    created_at: result.data.createdAt,
+    updated_at: result.data.updatedAt,
+  };
 }
 
 /**
@@ -97,7 +83,6 @@ async function saveGuildConfig(guildId, config) {
   if (isMockDb) {
     const now = new Date().toISOString();
     const current = guildConfigStore.get(guildId);
-
     const payload = {
       guild_id: guildId,
       verified_role_id: config.verified_role_id,
@@ -107,41 +92,24 @@ async function saveGuildConfig(guildId, config) {
       created_at: current?.created_at || now,
       updated_at: now,
     };
-
     guildConfigStore.set(guildId, payload);
     return Promise.resolve(payload);
   }
 
-  const id = generateId();
-  const result = await query(
-    `
-      INSERT INTO guild_config (
-        id,
-        guild_id,
-        verified_role_id,
-        verify_channel_id,
-        log_channel_id,
-        updated_at
-      )
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      ON CONFLICT (guild_id)
-      DO UPDATE SET
-        verified_role_id = EXCLUDED.verified_role_id,
-        verify_channel_id = EXCLUDED.verify_channel_id,
-        log_channel_id = EXCLUDED.log_channel_id,
-        updated_at = NOW()
-      RETURNING guild_id, verified_role_id, verify_channel_id, log_channel_id, updated_at
-    `,
-    [
-      id,
-      guildId,
-      config.verified_role_id,
-      config.verify_channel_id,
-      config.log_channel_id,
-    ]
-  );
+  const result = await apiCall('POST', '/api/bot/guild-config', {
+    guildId,
+    verifiedRoleId: config.verified_role_id,
+    verifyChannelId: config.verify_channel_id,
+    logChannelId: config.log_channel_id,
+  });
 
-  return result.rows[0];
+  return {
+    guild_id: result.data.guildId,
+    verified_role_id: result.data.verifiedRoleId,
+    verify_channel_id: result.data.verifyChannelId,
+    log_channel_id: result.data.logChannelId,
+    updated_at: result.data.updatedAt,
+  };
 }
 
 /**
@@ -166,31 +134,20 @@ async function createToken(token, guildId, userId, expiresAt) {
       created_at: new Date().toISOString(),
       mock: true,
     };
-
     mockTokenStore.set(token, payload);
     return Promise.resolve(payload);
   }
 
   const expiry = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
-  const id = generateId();
 
-  const result = await query(
-    `
-      INSERT INTO verification_tokens (
-        id,
-        token,
-        guild_id,
-        user_id,
-        discord_user_id,
-        expires_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, token, guild_id, user_id, discord_user_id, expires_at, used_at, created_at
-    `,
-    [id, token, guildId, userId, userId, expiry]
-  );
+  const result = await apiCall('POST', '/api/bot/token', {
+    token,
+    guildId,
+    userId,
+    expiresAt: expiry.toISOString(),
+  });
 
-  return result.rows[0];
+  return result.data;
 }
 
 /**
@@ -201,13 +158,9 @@ async function getPendingAssignment(token) {
   if (isMockDb) {
     const tokenRow = mockTokenStore.get(token);
 
-    // Caminho padrão: token criado pelo próprio bot no ambiente mock.
     if (tokenRow) {
       const guildConfig = guildConfigStore.get(tokenRow.guild_id);
-
-      if (!guildConfig?.verified_role_id) {
-        return Promise.resolve(null);
-      }
+      if (!guildConfig?.verified_role_id) return Promise.resolve(null);
 
       return Promise.resolve({
         token,
@@ -222,16 +175,11 @@ async function getPendingAssignment(token) {
       });
     }
 
-    // Fallback de desenvolvimento: o site em MOCK_DB aceita qualquer token válido por formato.
-    // Nesse cenário, usamos a configuração existente da guild para permitir testar adição real de cargo.
     if (guildConfigStore.size === 1) {
       const [[guildId, guildConfig]] = Array.from(guildConfigStore.entries());
+      if (!guildConfig?.verified_role_id) return Promise.resolve(null);
 
-      if (!guildConfig?.verified_role_id) {
-        return Promise.resolve(null);
-      }
-
-      console.warn('[database][MOCK_DB] Token não encontrado no mockTokenStore. Aplicando fallback com guild configurada.');
+      console.warn('[database][MOCK_DB] Token não encontrado. Fallback com guild configurada.');
 
       return Promise.resolve({
         token,
@@ -246,63 +194,43 @@ async function getPendingAssignment(token) {
       });
     }
 
-    if (guildConfigStore.size > 1) {
-      console.warn('[database][MOCK_DB] Token não encontrado e há múltiplas guilds no mock. Fallback desativado para evitar atribuição ambígua.');
-    }
-
     return Promise.resolve(null);
   }
 
-  const result = await query(
-    `
-      SELECT
-        vt.token,
-        vt.guild_id AS token_guild_id,
-        gc.verified_role_id,
-        gc.log_channel_id,
-        pra.id AS pending_id,
-        pra.discord_id AS pending_discord_id,
-        pra.guild_id AS pending_guild_id,
-        pra.role_id AS pending_role_id,
-        pra.processed
-      FROM verification_tokens vt
-      LEFT JOIN guild_config gc
-        ON gc.guild_id = vt.guild_id
-      LEFT JOIN LATERAL (
-        SELECT id, discord_id, guild_id, role_id, processed
-        FROM pending_role_assignments
-        WHERE token = vt.token
-        ORDER BY created_at DESC
-        LIMIT 1
-      ) pra ON true
-      WHERE vt.token = $1
-      LIMIT 1
-    `,
-    [token]
-  );
+  const result = await apiCall('GET', `/api/bot/token?token=${encodeURIComponent(token)}`);
+  return result.data;
+}
 
-  if (result.rowCount === 0) {
-    return null;
-  }
+/**
+ * Marca um pending assignment como processado.
+ */
+async function markPendingProcessed(pendingId) {
+  return apiCall('POST', '/api/bot/pending-assignment', {
+    action: 'markProcessed',
+    pendingId,
+  });
+}
 
-  const row = result.rows[0];
-
-  return {
-    token: row.token,
-    guild_id: row.pending_guild_id || row.token_guild_id,
-    role_id: row.pending_role_id || row.verified_role_id,
-    log_channel_id: row.log_channel_id || null,
-    pending_id: row.pending_id || null,
-    pending_discord_id: row.pending_discord_id || null,
-    processed: row.processed ?? null,
-  };
+/**
+ * Cria um pending assignment já processado.
+ */
+async function createProcessedAssignment(token, discordId, guildId, roleId) {
+  return apiCall('POST', '/api/bot/pending-assignment', {
+    action: 'createProcessed',
+    token,
+    discordId,
+    guildId,
+    roleId,
+  });
 }
 
 module.exports = {
-  pool,
-  query,
+  pool: null,
+  query: async () => ({ rows: [], rowCount: 0 }),
   getGuildConfig,
   saveGuildConfig,
   createToken,
   getPendingAssignment,
+  markPendingProcessed,
+  createProcessedAssignment,
 };
